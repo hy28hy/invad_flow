@@ -1,0 +1,29 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+
+# Local environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Datasets and generated feature/checkpoint artifacts
+data/
+datasets/
+cache/
+results/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.npy
+*.npz
+
+# Runtime output
+*.log
+*.jsonl

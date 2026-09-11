@@ -1,0 +1,14 @@
+# Install the CUDA build of torch/torchvision appropriate for this host first.
+# invad_v1 was developed with torch==2.5.1 and torchvision==0.20.1.
+torchcfm==1.0.7
+POT>=0.9.4,<1.0
+timm==1.0.12
+einops==0.8.0
+numpy>=1.26,<3
+scipy>=1.14,<2
+scikit-learn>=1.6,<2
+scikit-image>=0.25,<1
+pandas>=2.2,<3
+PyYAML>=6,<7
+Pillow>=11,<12
+tqdm>=4.67,<5

@@ -1,0 +1,87 @@
+backbone:
+  model_type: efficientnet-b4
+  outblocks: [1, 5, 9, 21]
+  outstrides: [2, 4, 8, 16]
+  pretrained: true
+  stride: 16
+
+data:
+  dataset_name: mvtec_ad_all
+  data_root: data/mvtec
+  category: all
+  img_size: 256
+  transform_type: imagenet
+  batch_size: 8
+  num_workers: 4
+  pin_memory: true
+  train: true
+  multi_category: false
+  num_normal_samples: -1
+
+cache:
+  path: cache/mvtec_train.pt
+  batch_size: 32
+  validation_fraction: 0.10
+  split_seed: 42
+
+# Matches the inspected invad_v1 all-category capacity. Reduce only as a separate ablation.
+model:
+  width: 2048
+  depth: 16
+  num_heads: 8
+  mlp_ratio: 4.0
+  patch_size: 1
+  z_channels: 768
+  num_classes: 15
+  class_conditioned: false
+  class_dropout_prob: 0.0
+  time_scale: 999.0
+  ema_decay: 0.999
+  warm_start_ddpm: null
+
+flow:
+  sigma: 0.0
+  normalizer_floor: 1.0e-4
+
+optimizer:
+  optimizer_name: adamw
+  init_lr: 1.0e-6
+  peak_lr: 5.0e-5
+  final_lr: 5.0e-6
+  num_epochs: 300
+  warmup_epochs: 40
+  weight_decay: 0.0
+  grad_clip: 1.0
+  betas: [0.9, 0.999]
+
+logging:
+  save_dir: results/mvtec_flow
+  log_interval: 10
+  save_interval: 25
+  save_optimizer: false
+
+distributed:
+  timeout_minutes: 15
+
+fidelity:
+  max_mean_mae: 0.15
+  max_logstd_mae: 0.20
+  max_euler_relative_error: 0.15
+  max_swd_ratio: 0.70
+
+evaluation:
+  operator: angular
+  batch_size: 32
+  warmup_batches: 2
+  probe_t: 0.4
+  curvature_dt: 0.2
+  curvature_mode: normalized_change
+  anchor_seed: 59
+  gaussian_sigma: 4.0
+  topk_fraction: 0.01
+  output: results/mvtec_flow/eval_angular.json
+
+meta:
+  seed: 42
+  device: cuda
+  amp: bf16
