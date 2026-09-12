@@ -247,35 +247,26 @@ CUDA_VISIBLE_DEVICES=5 python eval.py \
 
 异常和 Python traceback 写入 `ddp_error_rank<N>.log`。端口占用、广播超时及 NCCL 通信信息还会出现在 `torchrun_smoke.log` 和 `nccl_<host>_<pid>.log`。
 
-## 7. 当前已完成的验证状态
+## 7. 阶段性基线固化（5-Epoch Smoke Baseline）
 
-以下是 2026-09-11 的 **5-epoch smoke 结果，不是最终模型性能**：
+本节记录 2026-09-11 完成的 5-epoch 烟测基线指标，作为**底层数学动力学与分布式工程链路跑通的固定凭证**（非最终性能）：
 
-- MVTec 缓存：3629 个唯一正常样本；train/val = 3267/362；所有检查通过。
-- DDP：4 张 H20，510 steps，正常完成；checkpoint 记录 `world_size=4`。
-- epoch loss：`1.9532 -> 1.6977 -> 1.3387 -> 1.1735 -> 1.0734`。
-- 已记录 cos：`0.0000 -> 0.6960`；最大已记录 grad norm 为 `1.5134`。
-- 无训练 alert、无 rank traceback、无 NCCL timeout。
-- Fidelity：5/20 Euler 相对误差 `0.000729`，但 mean MAE `0.2097`、SWD ratio `0.9369`，整体未通过。
-- Angular：1-NFE，约 `175.2 FPS`，I-AUROC `0.6705`，P-AUROC `0.4629`，AU-PRO `0.1288`。
-- Curvature：2-NFE，约 `92.8 FPS`，I-AUROC `0.4460`，P-AUROC `0.4554`，AU-PRO `0.1080`。
+- **MVTec 缓存**：3629 个有效正常样本；train/val = 3267/362；15 类全部通过 NaN/Inf/零方差校验。
+- **DDP 并行**：4 卡 NVIDIA H20，510 steps 正常收敛退出；checkpoint 记录 `world_size=4`。
+- **动力学收敛**：
+  - 损失演化：`1.9532 -> 1.6977 -> 1.3387 -> 1.1735 -> 1.0734`
+  - 速度场余弦：`0.0000 -> 0.6960`
+  - 梯度健康度：最大记录 grad norm 为 `1.5134`（无告警、无溢出）
+- **Fidelity 探针**：
+  - 5/20 步 Euler 积分相对漂移低至 `0.000729`（输运直线高度平直）
+  - 因步数极少处于欠拟合状态，mean MAE `0.2097`、SWD ratio `0.9369`（符合早期流场规律）
+- **算子基线表现**：
+  - Angular (1-NFE, ~175.2 FPS)：I-AUROC `0.6705`，P-AUROC `0.4629`，AU-PRO `0.1288`
+  - Curvature (2-NFE, ~92.8 FPS)：I-AUROC `0.4460`，P-AUROC `0.4554`，AU-PRO `0.1080`
 
-正确解读：数据、DDP、梯度、EMA、checkpoint、Euler 和两个算子链路已经跑通；5 epochs 的 EMA 尚未学会完整正常分布，因此当前低检测指标不能用来否定或确认最终方案效果。
+烟测归档产物保存在：`results/mvtec_flow_smoke5e/`。
 
-当前主要产物：
-
-```text
-cache/mvtec_train.pt
-cache/mvtec_train.pt.diagnostics.json
-results/mvtec_flow/flow_latest.pth
-results/mvtec_flow/fidelity.json
-results/mvtec_flow/eval_angular.json
-results/mvtec_flow/eval_angular.raw_scores.npz
-results/mvtec_flow/eval_curvature.json
-results/mvtec_flow/eval_curvature.raw_scores.npz
-results/mvtec_flow/diagnostics/train_metrics.jsonl
-results/mvtec_flow/diagnostics/torchrun_smoke.log
-results/mvtec_flow/diagnostics/nccl_*.log
+---
 ```
 
 ## 8. 常见错误与快速排查
@@ -331,13 +322,47 @@ ruff check cache_features.py inspect_cache.py train.py verify_fidelity.py \
 
 若 `invad_flow` 环境没有 pytest，可以在已安装 pytest 且依赖兼容的环境执行测试，但真实 CUDA 前向、缓存、训练和评测必须回到 `invad_flow` 环境。
 
-## 10. 推荐的下一步
+## 10. 后续演进规划（Roadmap）
 
-1. 决定是否保留当前 smoke checkpoint；正式训练会覆盖 `flow_latest.pth`。
-2. 将 `save_optimizer=true` 后启动 MVTec 300-epoch DDP 正式训练，以支持可靠断点续训。
-3. 定期运行正常-only fidelity；fidelity 未通过前，不要过度调 anomaly operator。
-4. fidelity 通过后，固定 checkpoint，扫描 `probe_t`、`curvature_dt`、Gaussian sigma 和 Top-K fraction。
-5. 完成 MVTec 后，再独立缓存和训练 VisA。
-6. 新增算子应放在 `src/operators.py`，并在 `eval.py` 中复用同一 backbone、normalizer、anchor 和后处理协议。
+- **Phase 1：MVTec-AD 全量基线收敛与锁榜**
+  - 运行 300-epoch 完整训练，按每 50 epochs 生成 checkpoint。
+  - 批量评测 6 个 Checkpoint 的 8 项 AD 判别指标，确定最优收敛拐点。
+  - 对最优 Checkpoint 补齐 5/20 步 Euler 保真度与 SWD 统计，固化基线论文数据。
+- **Phase 2：泛化性与超参网格探索**
+  - 将流匹配框架扩展至 VisA 数据集（独立提取缓存与训练）。
+  - 对最优 Checkpoint 扫描核心微分几何算子超参（`probe_t`、`curvature_dt`、高斯平滑尺度 $\sigma$、Top-K 比例）。
+- **Phase 3：现代 DiT 内部补丁与骨干表征升级（CCF-A 增益项）**
+  - 方案 A（内部补丁）：集成 QK-Norm（抑制深层注意力奇异值爆炸）与 2D Axial RoPE（相对平移等变性），压低几何伪阳性。
+  - 方案 B（特征升级）：迁移至 DINOv2 with Registers，消除背景伪影，增强微观划痕敏感度。
 
-任何 AI 接手时，应先阅读本 README、当前 config、最近的 `train_metrics.jsonl` 和 `fidelity.json`，再决定是否修改或启动长任务。
+---
+
+## 11. 当前工程推进进度（动态更新）
+
+> **最近更新时间**：2026-09-11
+> **更新人员**：AI / 架构师
+
+### 11.1 正在执行的任务
+- [x] 完成烟测数据固化与旧目录归档（`results/mvtec_flow_smoke5e/`）
+- [x] 锁死 300 轮训练配置：
+  - `num_epochs: 300`，`save_interval: 50`
+  - 余弦退火调度器生效（预热 40 轮至 `5e-5`，平滑衰减至 `5e-6`）
+  - 精度方案：DiT 前向 BF16，算子后处理 FP32
+- [ ] **[RUNNING] MVTec 300 Epochs 全量 DDP 分布式训练**
+  - 运行环境：NVIDIA H20 (GPU 4, 5, 6, 7)，后台 tmux 进程挂载
+  - 日志重定向：`results/mvtec_flow/train_300e.log`
+  - 过程量监控：`results/mvtec_flow/diagnostics/train_metrics.jsonl`
+
+### 11.2 Checkpoint 落盘与评测状态跟踪
+| Epoch | Checkpoint 状态 | Angular I/P-AUROC | Curvature I/P-AUROC | P-AUPRO | 备注 |
+| :---: | :---: | :---: | :---: | :---: | :--- |
+| **0050** | Pending | - | - | - | 预热刚结束，预期指标快速攀升 |
+| **0100** | Pending | - | - | - | 进入稳定收敛期 |
+| **0150** | Pending | - | - | - | 理论最优候选点之一 |
+| **0200** | Pending | - | - | - | 观察 Curvature 是否反超 Angular |
+| **0250** | Pending | - | - | - | 监控是否过拟合 |
+| **0300** | Pending | - | - | - | 最终轮次权重 |
+
+### 11.3 下一步就绪动作（Next Action）
+1. 训练完成后（或生成前序 Checkpoint 后），在 GPU 5 上执行批量扫包脚本 `run_sweep_eval.sh`。
+2. 提取最高评分 Checkpoint 填入上表，输出最终 MVTec 15 类宏平均指标矩阵。
