@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-LOG_DIR="$PROJECT_DIR/results/mvtec_flow/diagnostics"
+LOG_DIR="$PROJECT_DIR/results/mvtec_flow_fixed/diagnostics"
 mkdir -p "$LOG_DIR"
 
 export CUDA_VISIBLE_DEVICES=4,5,6,7

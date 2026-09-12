@@ -1,7 +1,12 @@
 import torch
 
 from src.feature_cache import FeatureNormalizer
-from src.operators import deterministic_anchors, probe_flow_maps, topk_pool
+from src.operators import (
+    deterministic_anchor_bank,
+    expand_shared_anchor,
+    probe_flow_maps,
+    topk_pool,
+)
 
 
 class ConstantVelocity(torch.nn.Module):
@@ -33,9 +38,15 @@ def test_normalizer_round_trip_and_class_selection():
     torch.testing.assert_close(normalizer.decode(encoded, labels), x)
 
 
-def test_filename_anchors_are_stable_and_topk_uses_largest_values():
-    first = deterministic_anchors(["a.png", "b.png"], (2, 2, 2), seed=7, device=torch.device("cpu"))
-    second = deterministic_anchors(["a.png", "b.png"], (2, 2, 2), seed=7, device=torch.device("cpu"))
+def test_shared_anchor_bank_is_stable_and_topk_uses_largest_values():
+    first = deterministic_anchor_bank(
+        (2, 2, 2), seed=7, num_anchors=2, device=torch.device("cpu")
+    )
+    second = deterministic_anchor_bank(
+        (2, 2, 2), seed=7, num_anchors=2, device=torch.device("cpu")
+    )
     torch.testing.assert_close(first, second)
+    expanded = expand_shared_anchor(first[0], batch_size=3)
+    torch.testing.assert_close(expanded[0], expanded[2])
     score = topk_pool(torch.tensor([[[1.0, 2.0], [3.0, 4.0]]]), 0.5)
     torch.testing.assert_close(score, torch.tensor([3.5]))

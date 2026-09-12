@@ -1,368 +1,219 @@
-# InvAD Flow：AI 接手与运行手册
+# InvAD Flow：项目接手与运行手册
 
-本文是本项目的入口文档，目标是让新的 AI 或工程师无需阅读历史对话即可理解设计、约束、当前状态和下一步工作。
+本文用于让新的 AI 或工程师在没有历史对话的情况下安全接手项目。先读本文件，再改代码或启动训练。
 
-## 1. 项目目标与不可违反的边界
+## 1. 目标与边界
 
-本项目将原 InvAD 的 DDPM/DDIM 反演替换为：
+项目路径：`/data2/chenxuwu/medicalAD/invad_flow`。
 
-> 冻结 EfficientNet-B4 特征提取器 + OT-CFM 连续速度场 + 原生几何异常算子
+目标架构：冻结 EfficientNet-B4 → 272 通道多尺度特征 → OT-CFM 连续速度场 → 原生几何异常算子。它替代原 InvAD 的 DDPM/DDIM 反演和 `max-min+sum` 打分。
 
-核心目标是减少推理 NFE，同时保留或提升 MVTec-AD、VisA 的图像级和像素级异常检测性能。
+硬约束：
 
-必须遵守：
+- `/data2/chenxuwu/medicalAD/invad_v1` 只能只读参考，严禁修改、覆盖或写入产物。
+- 训练只使用正常训练图；测试标签和 mask 只能参与指标计算。
+- Flow 方向固定为 `x0=Gaussian noise, t=0` 到 `x1=normal feature, t=1`。
+- MVTec 和 VisA 必须使用各自独立的缓存、统计量和 checkpoint。
+- 当前 `class_conditioned: false` 与已检查的原 InvAD 联合类别主路径一致，不应在没有对照实验时擅自开启。
+- 原 InvAD 没有对 272 通道做 z-score；本项目的逐类别 z-score 是 Flow 训练稳定化设计，不是原版行为。
 
-- 当前项目根目录：本仓库根目录
-- 原始项目：本地环境中的 `invad_v1`（不随本仓库上传）
-- **严禁修改、覆盖、清理或在 `invad_v1` 中生成文件。** 它只能作为只读参考。
-- 训练数据只能使用正常样本；评测标签和 mask 只能用于最终指标计算，不能进入异常分数计算。
-- Flow 方向固定为 `x0=Gaussian noise, t=0` 到 `x1=normal feature, t=1`。不要反转方向。
-- 不要重新引入 DDPM scheduler、DDIM inversion 或旧版 `max-min+sum` 打分。
+## 2. 当前数据与模型契约
 
-## 2. 当前实现概览
-
-```text
-正常训练图像
-  -> 冻结 EfficientNet-B4（FP32）
-  -> 多层特征对齐并拼接为 [272, 16, 16]
-  -> 特征以 FP16 缓存；逐类别 mean/std 以 FP32 缓存
-  -> 逐类别标准化
-  -> OT-CFM 构造 (t, x_t, u_t)
-  -> DiT 回归速度 v_theta(x_t, t)
-  -> MSE(v_theta, u_t)
-
-测试图像
-  -> 同一个冻结 backbone 和同一份缓存统计量
-  -> 确定性 Gaussian anchor（由 seed + 文件名生成）
-  -> Angular 1-NFE 或 Curvature 2-NFE
-  -> FP32 双线性插值 + Gaussian blur + Top-K pooling
-  -> anomaly map、image score、最终指标
-```
-
-### OT-CFM 训练约定
-
-- 使用 `torchcfm.conditional_flow_matching.ExactOptimalTransportConditionalFlowMatcher`。
-- `flow.sigma` 必须为 `0.0`，对应直线 OT-CFM。
-- DiT 接收连续 `t in [0,1]`，`FlowDiT` 内部映射为 `t * time_scale`；默认 `time_scale=999`，用于复用原 DiT 时间嵌入尺度。
-- DiT 允许从零初始化；当前输出层沿用 DiT 的零初始化，因此第 0 步 `norm(v_theta)=0`、`cos=0` 是预期现象。
-- 当前 `class_conditioned=false`：DiT 不使用类别 embedding，但特征标准化仍然是逐类别的，因此类别编号与缓存必须一致。
-
-### 异常算子
-
-- `angular`：在插值轨迹探测点比较模型速度和 anchor→feature 位移方向，输出余弦距离；严格 1-NFE。
-- `curvature`：在两个时间点计算速度变化率；严格 2-NFE。
-- `both`：复用第一次速度前向，同时产生两个分数，总计 2-NFE。
-- 只有 DiT 前向使用 BF16/FP16 autocast。余弦、曲率、插值、滤波和 Top-K 必须保持 FP32，避免分数排序被低精度量化。
-
-## 3. 目录与文件职责
+训练链路：
 
 ```text
-invad_flow/
-├── cache_features.py          # 单卡提取训练正常特征，计算统计量并执行硬校验
-├── inspect_cache.py           # 独立复检已有缓存，不运行 backbone
-├── train.py                   # 单卡/DDP OT-CFM 训练、EMA、诊断和 checkpoint
-├── verify_fidelity.py         # 仅用正常验证特征进行 5/20 步 Euler 保真度检查
-├── eval.py                    # Angular/Curvature 评测与 raw score 保存
-├── run_ddp_smoke.sh           # 固定 GPU 4,5,6,7 的 5-epoch MVTec smoke launcher
-├── configs/
-│   ├── mvtec_flow.yml
-│   └── visa_flow.yml
-├── src/
-│   ├── backbones/             # 冻结 EfficientNet-B4
-│   ├── datasets/              # MVTec/VisA 数据读取
-│   ├── models/dit.py          # DiT 主体
-│   ├── flow_model.py          # 连续时间适配、构建模型、EMA、DDPM warm start
-│   ├── feature_cache.py       # 缓存 Dataset、Normalizer、兼容性检查
-│   ├── operators.py           # 确定性 anchor、两种算子和后处理
-│   └── adeval/                # AUROC/AP/AU-PRO 指标
-├── tests/test_core.py         # Normalizer、anchor、算子的核心测试
-├── cache/                     # 缓存产物，不提交源码仓库
-└── results/                   # checkpoint、指标、JSONL、NCCL 日志
+normal image
+  -> frozen EfficientNet-B4, FP32
+  -> aligned feature [272,16,16], FP32 cache
+  -> per-class FP32 mean/std normalization
+  -> Exact OT-CFM: (x0, x1) -> (t, xt, ut)
+  -> DiT predicts v_theta(xt,t)
+  -> MSE(v_theta,ut)
 ```
 
-不要随意修改以下契约：
+评测链路：
 
-- MVTec 输入 `256x256` 时，缓存特征必须为 `[N,272,16,16]`。
-- 缓存 `features` 必须为 FP16；`mean/std` 必须为 FP32，形状为 `[num_classes,272,1,1]`。
-- cache 中的 `labels`、`filenames`、`split` 和 `features` 第一维必须完全一致。
-- checkpoint 至少包含 `model`、`ema`、`normalizer`、`config`、`feature_shape`、`epoch`、`global_step`。
-- `eval.py` 默认加载 EMA；只有明确做消融时才使用 `--no-ema`。
-
-## 4. 环境
-
-已验证环境：
-
-- NVIDIA H20 96 GB
-- Python 3.10
-- PyTorch `2.10.0+cu128`
-- torchvision `0.25.0+cu128`
-- torchcfm `1.0.7`
-- POT `0.9.7.post1`
-- BF16 可用
-
-```bash
-cd /path/to/invad_flow
-conda activate invad_flow
-python -m pip install torchcfm==1.0.7 POT==0.9.7.post1
-python -m pip check
-
-CUDA_VISIBLE_DEVICES=5 python - <<'PY'
-import torch, torchcfm, ot
-print(torch.__version__, torch.version.cuda)
-print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
-print(torchcfm.__version__, ot.__version__)
-PY
+```text
+test image -> same FP32 backbone/normalizer
+  -> shared path-independent Gaussian anchor bank
+  -> Angular 1-NFE or Curvature 2-NFE per anchor
+  -> average anchors (default K=1)
+  -> FP32 bilinear resize -> Gaussian blur -> Top-K pooling
+  -> seven AD metrics + mAD + FPS
 ```
 
-设置 `CUDA_VISIBLE_DEVICES=5` 后，物理 GPU 5 在 Python 内是 `cuda:0`。
+关键契约：
 
-## 5. 标准运行流程
+- MVTec 256×256 输入对应 `[N,272,16,16]`。
+- `features/mean/std` 全部持久化为 FP32；`mean/std` 形状为 `[classes,272,1,1]`。
+- MVTec 缓存必须含 3629 个唯一正常样本，训练使用全部 3629 个。
+- `split` 中保留 90/10 标记仅用于 normal-only fidelity 子集；它不再从训练中扣除 10%。
+- `statistics_split: all` 表示统计量使用全部正常训练样本。
+- anchor 不能依赖绝对路径、文件名或 DataLoader batch；所有测试图共享同一 anchor bank。
+- 默认 `num_anchors: 1`，Angular/Curvature 分别为 1/2 NFE。增加 K 后 NFE 分别为 K/2K。
+- checkpoint 内保存 `cache_contract` 与 normalizer，混用旧缓存会被拒绝。
 
-### 5.1 MVTec 特征缓存：物理 GPU 5
+## 3. 文件职责
 
-```bash
-cd /path/to/invad_flow
-conda activate invad_flow
-CUDA_VISIBLE_DEVICES=5 python cache_features.py \
-  --config configs/mvtec_flow.yml
-
-CUDA_VISIBLE_DEVICES=5 python inspect_cache.py \
-  --config configs/mvtec_flow.yml
+```text
+cache_features.py       生成原始 FP32 特征缓存并执行硬校验
+inspect_cache.py        对缓存重新计数、校验 dtype/完整性/分布
+train.py                单卡或 DDP OT-CFM 训练、EMA、诊断、checkpoint
+verify_fidelity.py      normal-only 5/20 步 Euler 保真度检查
+eval.py                 Angular/Curvature、完整指标、raw score、FPS
+src/feature_cache.py    cache Dataset、normalizer、契约校验
+src/operators.py        shared anchor bank、动力学算子、后处理
+configs/*.yml           数据、缓存、模型、优化器、评测唯一配置源
+tests/test_core.py      核心算子和 normalizer 单测
+results/                checkpoint、评测 JSON、日志
 ```
 
-缓存脚本必须立即中止的情况：
+## 4. 当前状态（2026-09-12）
 
-- backbone 输出或 FP16 转换出现 NaN/Inf；
-- 任意类别缺失训练样本；
-- 任意类别的任意通道标准差为 0 或非有限值；
-- 样本数、标签、文件名或 split 长度不一致；
-- 特征、统计量 dtype 不符合契约。
+第一轮 300 epoch 已完成，但它使用了旧契约：FP16 cache、3267/3629 训练样本、按文件名生成的 per-image anchor。因此该轮可用于诊断趋势，不能作为修复后的最终 Flow baseline。
 
-当前 MVTec 缓存路径：`cache/mvtec_train.pt`，逐类诊断为 `cache/mvtec_train.pt.diagnostics.json`。
+第一轮产物保留在 `results/mvtec_flow/`；修复版配置写入 `results/mvtec_flow_fixed/`，两者不会相互覆盖。
 
-### 5.2 四卡 DDP smoke train
+第一轮 epoch 300，Angular 结果（百分制）：
 
-推荐直接运行：
+| I-AUROC | I-AP | I-F1max | P-AUROC | P-AP | P-F1max | AU-PRO | mAD | FPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 97.36 | 99.00 | 97.27 | 96.37 | 45.46 | 50.23 | 86.12 | 81.69 | 175.7 |
 
-```bash
-./run_ddp_smoke.sh
-```
+参考 InvAD baseline：
 
-等价核心命令：
+| I-AUROC | I-AP | I-F1max | P-AUROC | P-AP | P-F1max | AU-PRO | mAD | FPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 99.0 | 99.6 | 98.5 | 97.5 | 46.5 | 52.3 | 92.7 | 83.7 | 88.1 |
 
-```bash
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-torchrun --nproc_per_node=4 --master_port=29501 train.py \
-  --config configs/mvtec_flow.yml \
-  --epochs 5 \
-  --log_interval 20 \
-  --save_diagnostics
-```
+第一轮的主要缺口是 AU-PRO `-6.58`、P-F1max `-2.07`、I-AUROC `-1.64`、P-AUROC `-1.13`、mAD `-2.01`；速度约为参考值 2 倍。12 个 checkpoint 的指标持续上升到 epoch 300，没有出现后期回落，说明旧训练没有真正收敛到平台，也说明不能只把差距归因于单个算子超参。
 
-脚本还会设置 `TORCH_DISTRIBUTED_DEBUG`、`NCCL_DEBUG` 和 `TORCH_NCCL_ASYNC_ERROR_HANDLING`，将 stdout/stderr 与每个 rank 的 NCCL 日志写入 `results/mvtec_flow/diagnostics/`。
+已经完成的严重问题修复：
 
-### 5.3 正式训练
+- 新 `cache/mvtec_train.pt`：3629 个唯一样本，特征与统计量均 FP32，约 965 MiB。
+- 旧缓存保留为 `cache/mvtec_train_legacy_fp16_split90.pt`，没有删除。
+- 训练读取 `train_split: all`，不再丢弃 10% 正常样本。
+- DDP DataLoader 保留尾批，不再因 `drop_last=True` 每轮漏掉样本。
+- anchor 改成共享、与路径无关的固定 bank。
+- `eval.py` 输出全部 7 项指标、mAD、FPS，以及对 InvAD baseline 的百分制差值。
+- `--epochs 5` 仅提前停止，学习率仍按完整 300e 计划推进，不再把 40e warmup 压成 5e。
+- 末端学习率改为原 InvAD 实际使用的 `1e-6`；峰值仍为原版同值 `5e-5`。
+- 新 checkpoint 默认保存 optimizer/scheduler，支持精确恢复；文件会显著变大。
 
-移除 `--epochs 5` 即使用配置中的 `optimizer.num_epochs=300`：
-
-```bash
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-torchrun --nproc_per_node=4 --master_port=29501 train.py \
-  --config configs/mvtec_flow.yml \
-  --log_interval 20 \
-  --save_diagnostics
-```
-
-注意：
-
-- `flow_latest.pth` 会被新训练覆盖；需要保留 smoke checkpoint 时先另存。
-- 当前 `logging.save_optimizer=false`，checkpoint 约 9.2 GiB，只保存 model+EMA，不支持精确恢复 optimizer/scheduler。
-- 若正式长训必须断点续训，训练前将 `save_optimizer` 改为 `true`；checkpoint 会显著增大。
-- Rank 0 单独维护 EMA 和执行 checkpoint 保存，其余 rank 不持有 EMA 副本。
-
-### 5.4 正常特征保真度诊断
+旧 300e checkpoint 内是旧 normalizer。不要用新 `mvtec_train.pt` 对其做 fidelity 或 `--resume`；如需复查旧 fidelity，显式指定：
 
 ```bash
-CUDA_VISIBLE_DEVICES=5 python verify_fidelity.py \
-  --config configs/mvtec_flow.yml \
+python verify_fidelity.py \
+  --checkpoint results/mvtec_flow/flow_epoch_0300.pth \
+  --cache cache/mvtec_train_legacy_fp16_split90.pt \
   --steps 5,20
 ```
 
-该脚本不读取测试异常标签，仅使用缓存中的正常 validation split。默认自动读取 `<logging.save_dir>/flow_latest.pth`，并保存 `fidelity.json`。
+## 5. 环境与缓存
 
-重点检查：
-
-- 所有生成特征有限；
-- 正常特征空间均值和 log-std 是否接近；
-- 5 步与 20 步 Euler 是否一致；
-- 生成特征到正常特征的 SWD 是否明显优于初始噪声。
-
-若需要让未通过直接返回非零退出码，加 `--strict`。
-
-### 5.5 异常检测评测
+已验证：NVIDIA H20、Python 3.10、PyTorch 2.10.0+cu128、torchcfm 1.0.7、POT 0.9.7.post1。
 
 ```bash
-# 默认 Angular，1-NFE
-CUDA_VISIBLE_DEVICES=5 python eval.py \
-  --config configs/mvtec_flow.yml \
-  --save_raw_scores
+cd /data2/chenxuwu/medicalAD/invad_flow
+conda activate invad_flow
+python -m pip install -r requirements-flow.txt
 
-# Curvature，2-NFE
-CUDA_VISIBLE_DEVICES=5 python eval.py \
-  --config configs/mvtec_flow.yml \
-  --operator curvature \
-  --save_raw_scores
-
-# 同时评测两个算子，共享第一次前向，总计 2-NFE
-CUDA_VISIBLE_DEVICES=5 python eval.py \
-  --config configs/mvtec_flow.yml \
-  --operator both \
-  --save_raw_scores
+CUDA_VISIBLE_DEVICES=5 python cache_features.py --config configs/mvtec_flow.yml
+CUDA_VISIBLE_DEVICES=5 python inspect_cache.py --config configs/mvtec_flow.yml
 ```
 
-输出包含每类和宏平均的 I-AUROC、I-AP、I-F1Max、P-AUROC、P-AP、P-F1Max、AU-PRO，以及排除 DataLoader 的模型计算 FPS。
+缓存遇到以下情况必须失败：样本数不等于源数据集、文件名重复、NaN/Inf、零方差通道、shape/dtype 不符、类别缺失。MVTec 正确摘要应为：
 
-`--save_raw_scores` 保存 `[N,16,16]` 原始算子图、image score、类别、标签和文件名，方便后续排查或增加新算子。
-
-### 5.6 VisA
-
-将以上命令中的配置替换为 `configs/visa_flow.yml`。VisA 必须单独生成缓存和训练 checkpoint，不能复用 MVTec 的统计量或模型。
-
-## 6. 训练诊断与阻断规则
-
-`train.py --save_diagnostics` 将以下全局多卡均值写入 `train_metrics.jsonl`：
-
-- `loss`：`MSE(v_theta, u_t)`；
-- `norm_u_t`、`norm_v_theta`；
-- `cos_sim`；
-- `rms_u_t`、`rms_v_theta`；
-- `global_grad_norm`：梯度裁剪前的全局范数；
-- epoch、iteration、global step、learning rate。
-
-前 100 步内：
-
-- 如果 `cos_sim` 100 步始终小于等于 0，写入 alert；
-- 如果任一步 `global_grad_norm > 1e4`，立即写入 alert；
-- alert 同时记录 DiT 最后一层梯度的 min/max/mean/std/L2/finite fraction。
-
-异常和 Python traceback 写入 `ddp_error_rank<N>.log`。端口占用、广播超时及 NCCL 通信信息还会出现在 `torchrun_smoke.log` 和 `nccl_<host>_<pid>.log`。
-
-## 7. 阶段性基线固化（5-Epoch Smoke Baseline）
-
-本节记录 2026-09-11 完成的 5-epoch 烟测基线指标，作为**底层数学动力学与分布式工程链路跑通的固定凭证**（非最终性能）：
-
-- **MVTec 缓存**：3629 个有效正常样本；train/val = 3267/362；15 类全部通过 NaN/Inf/零方差校验。
-- **DDP 并行**：4 卡 NVIDIA H20，510 steps 正常收敛退出；checkpoint 记录 `world_size=4`。
-- **动力学收敛**：
-  - 损失演化：`1.9532 -> 1.6977 -> 1.3387 -> 1.1735 -> 1.0734`
-  - 速度场余弦：`0.0000 -> 0.6960`
-  - 梯度健康度：最大记录 grad norm 为 `1.5134`（无告警、无溢出）
-- **Fidelity 探针**：
-  - 5/20 步 Euler 积分相对漂移低至 `0.000729`（输运直线高度平直）
-  - 因步数极少处于欠拟合状态，mean MAE `0.2097`、SWD ratio `0.9369`（符合早期流场规律）
-- **算子基线表现**：
-  - Angular (1-NFE, ~175.2 FPS)：I-AUROC `0.6705`，P-AUROC `0.4629`，AU-PRO `0.1288`
-  - Curvature (2-NFE, ~92.8 FPS)：I-AUROC `0.4460`，P-AUROC `0.4554`，AU-PRO `0.1080`
-
-烟测归档产物保存在：`results/mvtec_flow_smoke5e/`。
-
----
+```text
+samples=3629
+configured_training_samples=3629
+feature_dtype=torch.float32
+statistics_dtype=torch.float32
+unique_filenames=3629
+duplicate_filenames=0
+feature_shape=[272,16,16]
+statistics_split=all
+configured_train_split=all
 ```
 
-## 8. 常见错误与快速排查
+## 6. 训练
 
-### CUDA 不可用
+四卡正式训练：
 
-先检查 `torch.__version__`、`torch.version.cuda`、驱动支持范围和 `torch.cuda.is_available()`。本机曾因 CUDA 13 构建高于驱动支持范围导致不可用，已验证的组合是 PyTorch CUDA 12.8。
+```bash
+cd /data2/chenxuwu/medicalAD/invad_flow
+conda activate invad_flow
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+torchrun --nproc_per_node=4 --master_port=29501 train.py \
+  --config configs/mvtec_flow.yml \
+  --log_interval 20 \
+  --save_diagnostics
+```
 
-### 第一步 cos 为 0
+smoke 只跑完整学习率计划的前 5 epoch：
 
-DiT 最终线性层零初始化导致第一步速度为 0，这是预期行为。若前 20–100 步仍不转正，再检查 flow 方向、normalizer、时间映射和梯度。
+```bash
+torchrun --nproc_per_node=4 --master_port=29501 train.py \
+  --config configs/mvtec_flow.yml --epochs 5 \
+  --log_interval 20 --save_diagnostics
+```
 
-### loss 看似下降但 fidelity 不改善
+修复版配置使用独立的 `results/mvtec_flow_fixed/`，不会覆盖第一轮产物。Rank 0 独占 EMA 和 checkpoint 写入。JSONL/TensorBoard 记录 loss、`norm_u_t`、`norm_v_theta`、cosine、未裁剪 grad norm、LR。
 
-依次检查：
+当前优化器计划：40e 从 `1e-6` warmup 到 `5e-5`，随后 cosine 降回 `1e-6`。DiT 最终层零初始化，所以 step 0 的速度范数和 cosine 为 0 是正常现象。
 
-1. 是否错误反转 `x0/x1`；
-2. 训练与评测是否使用同一份逐类别统计量；
-3. 类别编号是否与缓存一致；
-4. 是否错误使用未训练 model 而非 EMA；
-5. EMA decay 是否在短训练中造成过强滞后；
-6. 是否只训练了 smoke epochs。
+## 7. Fidelity 与完整评测
 
-### 像素指标极低
+```bash
+CUDA_VISIBLE_DEVICES=5 python verify_fidelity.py \
+  --config configs/mvtec_flow.yml --steps 5,20
 
-重点检查：
+CUDA_VISIBLE_DEVICES=5 python eval.py \
+  --config configs/mvtec_flow.yml \
+  --operator angular --save_raw_scores
 
-- feature map 是否保持 `16x16` 空间对应关系；
-- 算子是否沿 channel 维计算，而不是把空间维一起压平；
-- 是否先双线性上采样，再 Gaussian blur；
-- 几何与 Top-K 是否为 FP32；
-- mask 是否使用 nearest-neighbor resize；
-- anomaly map 是否发生符号反转或每图错误归一化。
+CUDA_VISIBLE_DEVICES=5 python eval.py \
+  --config configs/mvtec_flow.yml \
+  --operator curvature --save_raw_scores
+```
 
-### DDP 卡住或退出
+`eval.py` 每个算子输出：
 
-- 启动前检查 `ss -ltn | grep 29501`；
-- 检查四张卡是否空闲；
-- 查看 `ddp_error_rank<N>.log`、`torchrun_smoke.log` 和四份 NCCL 日志；
-- `NCCL INFO ... Abort COMPLETE` 在正常销毁 communicator 时可以出现，不等同于训练失败；应结合 torchrun 退出码和 traceback 判断。
+- 每类和 15 类宏平均：I-AUROC、I-AP、I-F1Max、P-AUROC、P-AP、P-F1Max、AU-PRO；
+- `mAD`：上述 7 项的算术平均；
+- `summary_percent`：与 InvAD 表格同顺序的百分制 8 项 + FPS；
+- `delta_vs_reference_percent`：相对配置中 reference baseline 的差值；
+- FPS 口径：backbone + flow operator + FP32 后处理，不含 DataLoader 和最终指标计算。
 
-## 9. 修改代码后的最低验证要求
+`--save_raw_scores` 同时保存原生 16×16 算子图、最终 256×256 anomaly map、mask、image score、标签、类别和文件名，可离线复算全部指标。
 
-每次修改训练、算子、normalizer 或缓存格式后至少执行：
+FPS 只有在硬件、batch size、warmup、精度模式和计时范围一致时才能直接与论文比较。
+
+## 8. 最低验证要求
 
 ```bash
 python -m compileall -q cache_features.py inspect_cache.py train.py \
-  verify_fidelity.py eval.py src
+  verify_fidelity.py eval.py src tests
 python -m pytest -q tests/test_core.py
 ruff check cache_features.py inspect_cache.py train.py verify_fidelity.py \
-  eval.py src/feature_cache.py src/flow_model.py src/operators.py tests/test_core.py
+  eval.py src/feature_cache.py src/operators.py tests/test_core.py
 ```
 
-若 `invad_flow` 环境没有 pytest，可以在已安装 pytest 且依赖兼容的环境执行测试，但真实 CUDA 前向、缓存、训练和评测必须回到 `invad_flow` 环境。
+训练前额外确认：
 
-## 10. 后续演进规划（Roadmap）
+```bash
+python inspect_cache.py --config configs/mvtec_flow.yml
+nvidia-smi
+ss -ltn | grep 29501 || true
+```
 
-- **Phase 1：MVTec-AD 全量基线收敛与锁榜**
-  - 运行 300-epoch 完整训练，按每 50 epochs 生成 checkpoint。
-  - 批量评测 6 个 Checkpoint 的 8 项 AD 判别指标，确定最优收敛拐点。
-  - 对最优 Checkpoint 补齐 5/20 步 Euler 保真度与 SWD 统计，固化基线论文数据。
-- **Phase 2：泛化性与超参网格探索**
-  - 将流匹配框架扩展至 VisA 数据集（独立提取缓存与训练）。
-  - 对最优 Checkpoint 扫描核心微分几何算子超参（`probe_t`、`curvature_dt`、高斯平滑尺度 $\sigma$、Top-K 比例）。
-- **Phase 3：现代 DiT 内部补丁与骨干表征升级（CCF-A 增益项）**
-  - 方案 A（内部补丁）：集成 QK-Norm（抑制深层注意力奇异值爆炸）与 2D Axial RoPE（相对平移等变性），压低几何伪阳性。
-  - 方案 B（特征升级）：迁移至 DINOv2 with Registers，消除背景伪影，增强微观划痕敏感度。
+## 9. 下一步（按优先级）
 
----
+1. 保留第一轮 `results/mvtec_flow/`；修复版只写 `results/mvtec_flow_fixed/`，不要删旧 checkpoint 或 raw scores。
+2. 用修复后的 FP32/full cache 做 5e DDP smoke，确认 startup 显示 `train_samples=3629`、`train_split=all`、`schedule_epochs=300`、`stop_epoch=5`，且新 checkpoint 含 `cache_contract` 和 optimizer/scheduler。
+3. smoke 只验证代码和数值健康，不比较 AD 指标。通过后立即开始新的 300e 正式训练。
+4. 每 25 epoch 用 shared K=1 Angular 跑固定协议评测；以 mAD 为主，同时观察 AU-PRO，不在训练中途改 anchor/后处理。
+5. 修复版正式基线锁定后，才依次做单变量实验：K=4 anchor averaging、class conditioning、逐类 vs 全局 normalization、global-batch OT pairing、probe/postprocess 参数。一次只改变一个因素。
+6. MVTec 修复版锁榜后再迁移 VisA，先重建 VisA FP32/full cache，不能复用 MVTec 模型。
 
-## 11. 当前工程推进进度（动态更新）
-
-> **最近更新时间**：2026-09-11
-> **更新人员**：AI / 架构师
-
-### 11.1 正在执行的任务
-- [x] 完成烟测数据固化与旧目录归档（`results/mvtec_flow_smoke5e/`）
-- [x] 锁死 300 轮训练配置：
-  - `num_epochs: 300`，`save_interval: 50`
-  - 余弦退火调度器生效（预热 40 轮至 `5e-5`，平滑衰减至 `5e-6`）
-  - 精度方案：DiT 前向 BF16，算子后处理 FP32
-- [ ] **[RUNNING] MVTec 300 Epochs 全量 DDP 分布式训练**
-  - 运行环境：NVIDIA H20 (GPU 4, 5, 6, 7)，后台 tmux 进程挂载
-  - 日志重定向：`results/mvtec_flow/train_300e.log`
-  - 过程量监控：`results/mvtec_flow/diagnostics/train_metrics.jsonl`
-
-### 11.2 Checkpoint 落盘与评测状态跟踪
-| Epoch | Checkpoint 状态 | Angular I/P-AUROC | Curvature I/P-AUROC | P-AUPRO | 备注 |
-| :---: | :---: | :---: | :---: | :---: | :--- |
-| **0050** | Pending | - | - | - | 预热刚结束，预期指标快速攀升 |
-| **0100** | Pending | - | - | - | 进入稳定收敛期 |
-| **0150** | Pending | - | - | - | 理论最优候选点之一 |
-| **0200** | Pending | - | - | - | 观察 Curvature 是否反超 Angular |
-| **0250** | Pending | - | - | - | 监控是否过拟合 |
-| **0300** | Pending | - | - | - | 最终轮次权重 |
-
-### 11.3 下一步就绪动作（Next Action）
-1. 训练完成后（或生成前序 Checkpoint 后），在 GPU 5 上执行批量扫包脚本 `run_sweep_eval.sh`。
-2. 提取最高评分 Checkpoint 填入上表，输出最终 MVTec 15 类宏平均指标矩阵。
+仍需关注但本轮未擅自改动的研究风险：DDP 每个 rank 内部独立做 OT pairing（有效 OT batch 较小）；逐类别 z-score 并非原 InvAD 设计；`class_conditioned=false` 下联合类别 Flow 是否足够；共享单 anchor 的方差。这些需要在修复后的同一工程基线上做受控验证，而不是与本轮 bug 修复混在一起。

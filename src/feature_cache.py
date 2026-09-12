@@ -101,3 +101,49 @@ def validate_cache_compatibility(dataset: CachedFeatureDataset, config: dict) ->
                 f"Cache mismatch for data.{key}: {cached_data[key]!r} != "
                 f"{config['data'].get(key)!r}"
             )
+    expected_dtype = str(config.get("cache", {}).get("feature_dtype", "float32")).lower()
+    aliases = {"float32": torch.float32, "fp32": torch.float32,
+               "float16": torch.float16, "fp16": torch.float16}
+    if expected_dtype not in aliases:
+        raise ValueError("cache.feature_dtype must be float32 or float16")
+    if dataset.features.dtype != aliases[expected_dtype]:
+        raise ValueError(
+            f"Cache dtype {dataset.features.dtype} does not match configured "
+            f"cache.feature_dtype={expected_dtype}"
+        )
+    source_samples = dataset.meta.get("source_samples")
+    if source_samples is not None and int(source_samples) != len(dataset.labels):
+        raise ValueError(
+            f"Incomplete cache: {len(dataset.labels)} tensors for {source_samples} source samples"
+        )
+
+
+def cache_contract(dataset: CachedFeatureDataset) -> dict[str, object]:
+    """Small checkpointable identity for preventing mixed cache generations."""
+    return {
+        "format_version": int(dataset.meta.get("format_version", 0)),
+        "samples": len(dataset.labels),
+        "feature_shape": list(dataset.feature_shape),
+        "feature_dtype": str(dataset.features.dtype),
+        "statistics_split": dataset.meta.get("statistics_split", "train"),
+        "split_seed": dataset.meta.get("split_seed"),
+    }
+
+
+def validate_checkpoint_cache(checkpoint: dict, dataset: CachedFeatureDataset) -> None:
+    """Reject a fidelity/resume run that mixes checkpoint and cache statistics."""
+    state = checkpoint.get("normalizer", {})
+    floor = float(checkpoint.get("config", {}).get("flow", {}).get("normalizer_floor", 1e-4))
+    expected = (("mean", dataset.mean), ("std", dataset.std.clamp_min(floor)))
+    for key, cached in expected:
+        if key not in state or not torch.equal(state[key].cpu().float(), cached.cpu().float()):
+            raise ValueError(
+                f"Checkpoint normalizer.{key} does not match the selected cache; "
+                "do not mix legacy checkpoints with a regenerated cache"
+            )
+    recorded = checkpoint.get("cache_contract")
+    if recorded is not None and recorded != cache_contract(dataset):
+        raise ValueError(
+            f"Checkpoint/cache contract mismatch: checkpoint={recorded}, "
+            f"cache={cache_contract(dataset)}"
+        )

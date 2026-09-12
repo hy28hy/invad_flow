@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Sequence
 
@@ -8,20 +7,26 @@ import torch
 import torch.nn.functional as F
 
 
-def deterministic_anchors(
-    filenames: Sequence[str], feature_shape: Sequence[int], *, seed: int,
+def deterministic_anchor_bank(
+    feature_shape: Sequence[int], *, seed: int, num_anchors: int,
     device: torch.device, dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """One stable Gaussian anchor per filename, independent of loader batching."""
-    anchors = []
-    for filename in filenames:
-        digest = hashlib.sha256(f"{seed}:{filename}".encode("utf-8")).digest()
-        sample_seed = int.from_bytes(digest[:8], "little") % (2**63 - 1)
-        generator = torch.Generator(device=device)
-        generator.manual_seed(sample_seed)
-        anchors.append(torch.randn(tuple(feature_shape), generator=generator,
-                                   device=device, dtype=dtype))
-    return torch.stack(anchors, dim=0)
+    """Return a path-independent Gaussian anchor bank shared by every image."""
+    if num_anchors <= 0:
+        raise ValueError("num_anchors must be positive")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    return torch.randn(
+        (num_anchors, *tuple(feature_shape)), generator=generator,
+        device=device, dtype=dtype,
+    )
+
+
+def expand_shared_anchor(anchor: torch.Tensor, batch_size: int) -> torch.Tensor:
+    """Broadcast one anchor to a batch without allocating per-image noise."""
+    if anchor.ndim != 3:
+        raise ValueError(f"anchor must be [C,H,W], got {tuple(anchor.shape)}")
+    return anchor.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
 
 @torch.inference_mode()

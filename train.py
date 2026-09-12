@@ -20,7 +20,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from src.feature_cache import CachedFeatureDataset, normalizer_from_cache, validate_cache_compatibility
+from src.feature_cache import (
+    CachedFeatureDataset,
+    cache_contract,
+    normalizer_from_cache,
+    validate_cache_compatibility,
+    validate_checkpoint_cache,
+)
 from src.flow_model import build_flow_model, make_ema, update_ema, warm_start_from_ddpm
 
 
@@ -82,7 +88,8 @@ def atomic_save(payload: dict, path: Path) -> None:
 
 def checkpoint_payload(model, ema, normalizer, optimizer, scheduler,
                        config: dict, epoch: int, global_step: int,
-                       feature_shape: tuple[int, int, int], save_optimizer: bool) -> dict:
+                       feature_shape: tuple[int, int, int], save_optimizer: bool,
+                       cache_identity: dict[str, object]) -> dict:
     payload = {
         "format_version": 2,
         "model": model.state_dict(),
@@ -93,6 +100,7 @@ def checkpoint_payload(model, ema, normalizer, optimizer, scheduler,
         "global_step": global_step,
         "feature_shape": feature_shape,
         "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+        "cache_contract": cache_identity,
     }
     if save_optimizer:
         payload["optimizer"] = optimizer.state_dict()
@@ -148,7 +156,12 @@ def run(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     if args.log_interval is not None:
         config["logging"]["log_interval"] = args.log_interval
-    num_epochs = int(args.epochs or config["optimizer"]["num_epochs"])
+    schedule_epochs = int(config["optimizer"]["num_epochs"])
+    stop_epoch = int(args.epochs) if args.epochs is not None else schedule_epochs
+    if not 0 < stop_epoch <= schedule_epochs:
+        raise ValueError(
+            f"--epochs must be in [1, {schedule_epochs}]; got {stop_epoch}"
+        )
     timeout_minutes = int(config.get("distributed", {}).get("timeout_minutes", 15))
     distributed, rank, world_size, local_rank, device = distributed_context(timeout_minutes)
     is_main = rank == 0
@@ -175,7 +188,10 @@ def run(args: argparse.Namespace) -> None:
 
     cache = CachedFeatureDataset(config["cache"]["path"], split="all")
     validate_cache_compatibility(cache, config)
-    train_set = CachedFeatureDataset(config["cache"]["path"], split="train")
+    train_split = str(config["cache"].get("train_split", "all"))
+    if train_split not in {"all", "train"}:
+        raise ValueError("cache.train_split must be 'all' or 'train'")
+    train_set = CachedFeatureDataset(config["cache"]["path"], split=train_split)
     if len(train_set) == 0:
         raise RuntimeError("The cached training split is empty")
     sampler = DistributedSampler(
@@ -189,7 +205,9 @@ def run(args: argparse.Namespace) -> None:
         sampler=sampler,
         num_workers=int(config["data"].get("num_workers", 4)),
         pin_memory=bool(config["data"].get("pin_memory", True)),
-        drop_last=True,
+        # Keep the tail batch: OT-CFM supports variable local batch sizes and
+        # dropping it would silently omit normal samples every epoch.
+        drop_last=bool(config["data"].get("drop_last", False)),
         persistent_workers=int(config["data"].get("num_workers", 4)) > 0,
     )
 
@@ -206,6 +224,7 @@ def run(args: argparse.Namespace) -> None:
     resume_payload = None
     if args.resume:
         resume_payload = torch.load(args.resume, map_location="cpu", weights_only=False)
+        validate_checkpoint_cache(resume_payload, cache)
         base_model.load_state_dict(resume_payload["model"], strict=True)
         normalizer.load_state_dict(resume_payload["normalizer"], strict=True)
 
@@ -225,7 +244,7 @@ def run(args: argparse.Namespace) -> None:
         weight_decay=float(opt_cfg.get("weight_decay", 0.0)),
         betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
     )
-    scheduler = build_scheduler(optimizer, config, len(loader), num_epochs)
+    scheduler = build_scheduler(optimizer, config, len(loader), schedule_epochs)
     start_epoch = 0
     global_step = 0
     if resume_payload is not None:
@@ -268,6 +287,9 @@ def run(args: argparse.Namespace) -> None:
                 p.numel() for p in base_model.parameters() if p.requires_grad
             ) / 1e6,
             "train_samples": len(train_set),
+            "train_split": train_split,
+            "schedule_epochs": schedule_epochs,
+            "stop_epoch": stop_epoch,
             "feature_shape": cache.feature_shape,
             "class_conditioned": class_conditioned,
             "device": str(device),
@@ -278,7 +300,7 @@ def run(args: argparse.Namespace) -> None:
             append_jsonl(diagnostics_log, startup)
 
     model.train()
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(start_epoch, stop_epoch):
         if sampler is not None:
             sampler.set_epoch(epoch)
         epoch_loss = 0.0
@@ -364,11 +386,12 @@ def run(args: argparse.Namespace) -> None:
                 append_jsonl(diagnostics_log, epoch_record)
         if distributed:
             dist.barrier(device_ids=[local_rank])
-        should_save = (epoch + 1) % save_interval == 0 or epoch + 1 == num_epochs
+        should_save = (epoch + 1) % save_interval == 0 or epoch + 1 == stop_epoch
         if is_main and should_save:
             payload = checkpoint_payload(
                 base_model, ema, normalizer, optimizer, scheduler, config,
                 epoch, global_step, cache.feature_shape, save_optimizer,
+                cache_contract(cache),
             )
             atomic_save(payload, output_dir / "flow_latest.pth")
             if (epoch + 1) % save_interval == 0:
@@ -406,7 +429,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DDP OT-CFM training on frozen InvAD features")
     parser.add_argument("--config", required=True)
     parser.add_argument("--resume", default=None)
-    parser.add_argument("--epochs", type=int, default=None, help="Override total epochs for smoke runs")
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Stop after this epoch; LR schedule still uses optimizer.num_epochs",
+    )
     parser.add_argument("--log-interval", "--log_interval", dest="log_interval", type=int, default=None)
     parser.add_argument(
         "--save-diagnostics", "--save_diagnostics", dest="save_diagnostics", action="store_true"

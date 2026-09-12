@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from cache_features import cache_diagnostics
+from src.datasets import build_dataset
 
 
 def main(args: argparse.Namespace) -> None:
@@ -19,11 +20,26 @@ def main(args: argparse.Namespace) -> None:
     missing = required.difference(payload)
     if missing:
         raise RuntimeError(f"Malformed cache; missing keys: {sorted(missing)}")
+    dtype_name = str(config["cache"].get("feature_dtype", "float32")).lower()
+    expected_dtype = torch.float32 if dtype_name in {"float32", "fp32"} else torch.float16
+    data_cfg = dict(config["data"])
+    data_cfg["train"] = True
+    expected_samples = len(build_dataset(**data_cfg))
     report = cache_diagnostics(
         payload["features"], payload["labels"], payload["split"],
         payload["mean"], payload["std"], list(payload["filenames"]),
         int(config["model"]["num_classes"]),
+        expected_dtype=expected_dtype, expected_samples=expected_samples,
     )
+    train_split = str(config["cache"].get("train_split", "all"))
+    report.update({
+        "statistics_split": payload["meta"].get("statistics_split", "train"),
+        "configured_train_split": train_split,
+        "configured_training_samples": (
+            len(payload["features"])
+            if train_split == "all" else int((payload["split"] == 0).sum())
+        ),
+    })
     report.update({"cache": str(path.resolve()), "bytes": path.stat().st_size})
     print(json.dumps(report, indent=2, ensure_ascii=False))
 

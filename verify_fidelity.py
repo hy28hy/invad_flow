@@ -9,7 +9,7 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from src.feature_cache import CachedFeatureDataset, FeatureNormalizer
+from src.feature_cache import CachedFeatureDataset, FeatureNormalizer, validate_checkpoint_cache
 from src.flow_model import build_flow_model
 
 
@@ -62,7 +62,9 @@ def main(args: argparse.Namespace) -> None:
     if len(steps) != 2 or min(steps) <= 0 or steps[0] >= steps[1]:
         raise ValueError("--steps must be two increasing positive integers, e.g. 5,20")
     coarse_steps, reference_steps = steps
-    dataset = CachedFeatureDataset(config["cache"]["path"], split="val")
+    cache_path = args.cache or config["cache"]["path"]
+    dataset = CachedFeatureDataset(cache_path, split="val")
+    validate_checkpoint_cache(checkpoint, dataset)
     if len(dataset) == 0:
         raise RuntimeError("No normal validation features are present in the cache")
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -124,6 +126,7 @@ def main(args: argparse.Namespace) -> None:
     }
     report = {
         "checkpoint": str(checkpoint_path.resolve()),
+        "cache": str(Path(cache_path).resolve()),
         "steps": steps,
         "normal_validation_samples": len(real),
         "finite": finite,
@@ -151,6 +154,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Normal-only five-step Euler fidelity check")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--config", default=None, help="Infers <logging.save_dir>/flow_latest.pth")
+    parser.add_argument("--cache", default=None, help="Cache matching the checkpoint normalizer")
     parser.add_argument("--steps", default="5,20")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--projections", type=int, default=64)

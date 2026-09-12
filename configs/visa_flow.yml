@@ -14,6 +14,7 @@ data:
   batch_size: 4
   num_workers: 4
   pin_memory: true
+  drop_last: false
   train: true
   multi_category: false
   num_normal_samples: -1
@@ -21,6 +22,9 @@ data:
 cache:
   path: cache/visa_train.pt
   batch_size: 32
+  feature_dtype: float32
+  statistics_split: all
+  train_split: all
   validation_fraction: 0.10
   split_seed: 42
 
@@ -46,7 +50,7 @@ optimizer:
   optimizer_name: adamw
   init_lr: 1.0e-6
   peak_lr: 5.0e-5
-  final_lr: 5.0e-6
+  final_lr: 1.0e-6
   num_epochs: 300
   warmup_epochs: 40
   weight_decay: 0.0
@@ -57,7 +61,7 @@ logging:
   save_dir: results/visa_flow
   log_interval: 10
   save_interval: 25
-  save_optimizer: false
+  save_optimizer: true
 
 distributed:
   timeout_minutes: 15
@@ -75,6 +79,8 @@ evaluation:
   probe_t: 0.4
   curvature_dt: 0.2
   curvature_mode: normalized_change
+  anchor_mode: shared
+  num_anchors: 1
   anchor_seed: 59
   gaussian_sigma: 4.0
   topk_fraction: 0.01

@@ -14,6 +14,7 @@ data:
   batch_size: 8
   num_workers: 4
   pin_memory: true
+  drop_last: false
   train: true
   multi_category: false
   num_normal_samples: -1
@@ -21,6 +22,9 @@ data:
 cache:
   path: cache/mvtec_train.pt
   batch_size: 32
+  feature_dtype: float32
+  statistics_split: all
+  train_split: all
   validation_fraction: 0.10
   split_seed: 42
 
@@ -47,7 +51,7 @@ optimizer:
   optimizer_name: adamw
   init_lr: 1.0e-6
   peak_lr: 5.0e-5
-  final_lr: 5.0e-6
+  final_lr: 1.0e-6
   num_epochs: 300
   warmup_epochs: 40
   weight_decay: 0.0
@@ -55,10 +59,11 @@ optimizer:
   betas: [0.9, 0.999]
 
 logging:
-  save_dir: results/mvtec_flow
+  # Keep the first FP16/90%-data run immutable under results/mvtec_flow.
+  save_dir: results/mvtec_flow_fixed
   log_interval: 10
   save_interval: 25
-  save_optimizer: false
+  save_optimizer: true
 
 distributed:
   timeout_minutes: 15
@@ -76,12 +81,27 @@ evaluation:
   probe_t: 0.4
   curvature_dt: 0.2
   curvature_mode: normalized_change
+  anchor_mode: shared
+  num_anchors: 1
   anchor_seed: 59
   gaussian_sigma: 4.0
   topk_fraction: 0.01
-  output: results/mvtec_flow/eval_angular.json
+  output: results/mvtec_flow_fixed/eval_angular.json
 
 meta:
   seed: 42
   device: cuda
   amp: bf16
+
+reference_baseline:
+  name: InvAD MVTec baseline
+  metrics_percent:
+    I-AUROC: 99.0
+    I-AP: 99.6
+    I-F1Max: 98.5
+    P-AUROC: 97.5
+    P-AP: 46.5
+    P-F1Max: 52.3
+    AU-PRO: 92.7
+    mAD: 83.7
+    FPS: 88.1

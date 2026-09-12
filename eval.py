@@ -24,11 +24,38 @@ from src.datasets import build_dataset
 from src.feature_cache import FeatureNormalizer
 from src.flow_model import build_flow_model
 from src.operators import (
-    deterministic_anchors,
+    deterministic_anchor_bank,
+    expand_shared_anchor,
     postprocess_map,
     probe_flow_maps,
     topk_pool,
 )
+
+METRIC_ORDER = (
+    "I-AUROC", "I-AP", "I-F1Max", "P-AUROC", "P-AP", "P-F1Max", "AU-PRO", "mAD"
+)
+
+
+def validate_runtime_config(runtime: dict, trained: dict) -> None:
+    """Fail before evaluation when the extractor contract changed."""
+    for key in ("dataset_name", "img_size", "transform_type", "category"):
+        if runtime["data"].get(key) != trained["data"].get(key):
+            raise ValueError(
+                f"Runtime data.{key}={runtime['data'].get(key)!r} differs from "
+                f"checkpoint value {trained['data'].get(key)!r}"
+            )
+    runtime_root = Path(runtime["data"]["data_root"]).resolve()
+    trained_root = Path(trained["data"]["data_root"]).resolve()
+    if runtime_root != trained_root:
+        raise ValueError(f"Runtime data root {runtime_root} != checkpoint root {trained_root}")
+    if runtime["backbone"] != trained["backbone"]:
+        raise ValueError("Runtime backbone config differs from the training checkpoint")
+
+
+def percent_summary(metrics: dict[str, float], fps: float | None) -> dict[str, float | None]:
+    summary = {key: 100.0 * float(metrics[key]) for key in METRIC_ORDER}
+    summary["FPS"] = fps
+    return summary
 
 
 def resolve_checkpoint(args: argparse.Namespace) -> Path:
@@ -104,6 +131,7 @@ def main(args: argparse.Namespace) -> None:
             runtime_config = yaml.safe_load(handle)
     else:
         runtime_config = copy.deepcopy(train_config)
+    validate_runtime_config(runtime_config, train_config)
 
     eval_cfg = runtime_config["evaluation"]
     operator = args.operator or eval_cfg.get("operator", "angular")
@@ -139,6 +167,14 @@ def main(args: argparse.Namespace) -> None:
     ).to(device).eval()
     backbone = get_backbone(**runtime_config["backbone"]).to(device).eval()
     backbone.requires_grad_(False)
+    anchor_mode = str(eval_cfg.get("anchor_mode", "shared"))
+    if anchor_mode != "shared":
+        raise ValueError("Only path-independent evaluation.anchor_mode='shared' is supported")
+    num_anchors = int(args.num_anchors or eval_cfg.get("num_anchors", 1))
+    anchor_bank = deterministic_anchor_bank(
+        feature_shape, seed=int(eval_cfg.get("anchor_seed", seed + 17)),
+        num_anchors=num_anchors, device=device, dtype=torch.float32,
+    )
 
     records = {
         "labels": [], "class_labels": [], "class_names": [], "filenames": [], "masks": [],
@@ -161,20 +197,26 @@ def main(args: argparse.Namespace) -> None:
             # Match cache extraction: backbone and normalization remain FP32.
             raw_feature, _ = backbone(images)
             feature = normalizer.encode(raw_feature.float(), labels)
-            anchors = deterministic_anchors(
-                filenames, feature_shape, seed=int(eval_cfg.get("anchor_seed", seed + 17)),
-                device=device, dtype=feature.dtype,
-            )
-            raw_maps = probe_flow_maps(
-                model, feature, anchors,
-                labels if model.class_conditioned else None,
-                need_angular="angular" in requested,
-                need_curvature="curvature" in requested,
-                probe_t=float(eval_cfg.get("probe_t", 0.4)),
-                curvature_dt=float(eval_cfg.get("curvature_dt", 0.2)),
-                curvature_mode=eval_cfg.get("curvature_mode", "normalized_change"),
-                amp_dtype=amp_dtype if device.type == "cuda" else None,
-            )
+            raw_maps = {name: torch.zeros(
+                feature.shape[0], feature.shape[2], feature.shape[3],
+                device=device, dtype=torch.float32,
+            ) for name in requested}
+            for shared_anchor in anchor_bank:
+                anchor = expand_shared_anchor(shared_anchor, feature.shape[0])
+                anchor_maps = probe_flow_maps(
+                    model, feature, anchor,
+                    labels if model.class_conditioned else None,
+                    need_angular="angular" in requested,
+                    need_curvature="curvature" in requested,
+                    probe_t=float(eval_cfg.get("probe_t", 0.4)),
+                    curvature_dt=float(eval_cfg.get("curvature_dt", 0.2)),
+                    curvature_mode=eval_cfg.get("curvature_mode", "normalized_change"),
+                    amp_dtype=amp_dtype if device.type == "cuda" else None,
+                )
+                for name in requested:
+                    raw_maps[name].add_(anchor_maps[name])
+            for name in requested:
+                raw_maps[name].div_(num_anchors)
             # Geometry, resize, filtering and pooling stay FP32 so score
             # rankings are not quantized to BF16/FP16 steps.
             processed = {
@@ -210,20 +252,45 @@ def main(args: argparse.Namespace) -> None:
                 records[name]["maps"].append(processed[name].float().cpu().numpy())
                 records[name]["scores"].append(scores[name].float().cpu().numpy())
 
+    fps = timed_images / elapsed if elapsed > 0 else None
+    results = {name: evaluate_operator(records, name) for name in requested}
+    for name in requested:
+        results[name]["summary_percent"] = percent_summary(
+            results[name]["macro_average"], fps
+        )
     report = {
         "checkpoint": str(checkpoint_path.resolve()),
         "operator": operator,
-        "nfe": 2 if "curvature" in requested else 1,
+        "nfe": num_anchors * (2 if "curvature" in requested else 1),
         "samples": len(records["labels"]),
-        "compute_fps_excluding_dataloader": timed_images / elapsed if elapsed > 0 else None,
+        "compute_fps_excluding_dataloader": fps,
+        "metric_order": [*METRIC_ORDER, "FPS"],
+        "fps_scope": "backbone + flow operator + FP32 postprocess; excludes DataLoader and metrics",
         "settings": {
             key: eval_cfg.get(key) for key in (
                 "probe_t", "curvature_dt", "curvature_mode",
-                "gaussian_sigma", "topk_fraction", "anchor_seed"
+                "gaussian_sigma", "topk_fraction", "anchor_seed",
+                "anchor_mode", "num_anchors"
             )
         },
-        "results": {name: evaluate_operator(records, name) for name in requested},
+        "results": results,
+        "summary_percent": {
+            name: results[name]["summary_percent"] for name in requested
+        },
     }
+    report["settings"].update({"anchor_mode": anchor_mode, "num_anchors": num_anchors})
+    reference = runtime_config.get("reference_baseline")
+    if reference:
+        baseline = reference["metrics_percent"]
+        report["reference_baseline"] = reference
+        report["delta_vs_reference_percent"] = {
+            name: {
+                key: (results[name]["summary_percent"][key] - baseline[key])
+                for key in (*METRIC_ORDER, "FPS")
+                if results[name]["summary_percent"][key] is not None and key in baseline
+            }
+            for name in requested
+        }
     if args.output:
         output = Path(args.output)
     else:
@@ -244,10 +311,14 @@ def main(args: argparse.Namespace) -> None:
             "class_labels": np.asarray(records["class_labels"], dtype=np.int64),
             "class_names": np.asarray(records["class_names"]),
             "filenames": np.asarray(records["filenames"]),
+            "masks": np.concatenate(records["masks"], axis=0).astype(np.uint8),
         }
         for name in requested:
             raw_payload[f"{name}_feature_maps"] = np.concatenate(
                 records[name]["raw_maps"], axis=0
+            )
+            raw_payload[f"{name}_anomaly_maps"] = np.concatenate(
+                records[name]["maps"], axis=0
             )
             raw_payload[f"{name}_image_scores"] = np.concatenate(
                 records[name]["scores"], axis=0
@@ -268,5 +339,6 @@ if __name__ == "__main__":
     parser.add_argument("--operator", choices=["angular", "curvature", "both"], default=None)
     parser.add_argument("--output", default=None)
     parser.add_argument("--no-ema", action="store_true")
+    parser.add_argument("--num-anchors", "--num_anchors", type=int, default=None)
     parser.add_argument("--save-raw-scores", "--save_raw_scores", action="store_true")
     main(parser.parse_args())
